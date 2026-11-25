@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Cielo respirado">
+<title>Cielo respirado — en vivo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+    font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; color: #eee;
+    -webkit-user-select: none; user-select: none; touch-action: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #menu { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 14px; padding: 24px; text-align: center;
+    background: rgba(8, 9, 14, 0.72); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+  #menu { overflow-y: auto; }
+  .botones { display: flex; flex-direction: column; gap: 10px; align-items: center; }
+  @media (max-height: 520px) {
+    #menu { gap: 8px; padding: 12px; }
+    h1 { font-size: 22px; }
+    #estado { font-size: 11px; line-height: 1.45; min-height: 0; }
+    .botones { flex-direction: row; flex-wrap: wrap; justify-content: center; }
+    button { min-width: 0; padding: 8px 16px; font-size: 14px; }
+  }
+  #menu.oculto, #info.oculto, #salir.oculto { display: none; }
+  h1 { margin: 0; font-weight: 300; font-size: 30px; letter-spacing: 0.04em; }
+  .sub { margin: 0; opacity: 0.7; font-size: 14px; }
+  #estado { font-size: 13px; opacity: 0.85; line-height: 1.6; min-height: 3.2em; max-width: 520px; }
+  button { font: inherit; font-size: 16px; color: #111; background: #eee; border: 0; border-radius: 22px;
+    padding: 11px 26px; min-width: 240px; cursor: pointer; }
+  button.sec { background: transparent; color: #eee; border: 1px solid rgba(255,255,255,0.4); }
+  label { font-size: 12px; opacity: 0.75; display: flex; flex-direction: column; gap: 6px; align-items: center; }
+  input[type=range] { width: 240px; }
+  #info { position: fixed; left: 18px; bottom: 16px; font-size: 12px; opacity: 0.75;
+    text-shadow: 0 0 4px rgba(0,0,0,0.8), 0 0 12px rgba(0,0,0,0.5); pointer-events: none; line-height: 1.5; }
+  #salir { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); min-width: 0;
+    padding: 8px 18px; font-size: 13px; background: rgba(0,0,0,0.5); color: #fff; }
+</style>
+</head>
+<body>
+<canvas id="lienzo"></canvas>
+
+<div id="menu">
+  <h1>Cielo respirado</h1>
+  <p class="sub">El aire de Monterrey, ahora.</p>
+  <div id="estado">Consultando el aire…</div>
+  <div class="botones">
+    <button id="btnCardboard">Entrar con Cardboard</button>
+    <button id="btnPantalla" class="sec">Ver en pantalla</button>
+    <button id="btnModo" class="sec">Modo memoria: últimos 7 días</button>
+  </div>
+  <label>Separación de lentes (ajústala si ves doble)
+    <input id="sep" type="range" min="0.34" max="0.5" step="0.005" value="0.5">
+  </label>
+</div>
+<div id="info" class="oculto"></div>
+<button id="salir" class="oculto">Salir</button>
+
+<script>
+// ============================================================
+//  CIELO RESPIRADO — versión en tiempo real
+//  Un skyspace virtual: el cielo que ves por la abertura es el cielo
+//  que se respira en Monterrey en este momento.
+//
+//  · Posición del sol: calculada para la hora real y las coordenadas.
+//  · PM2.5 y ozono: Open-Meteo Air Quality API (modelo CAMS, ~45 km,
+//    CC BY 4.0). Se actualiza cada 15 minutos.
+//  · Promedio de 24 h > 15 µg/m³ (guía OMS): el borde de la abertura se
+//    disuelve, la niebla llena el cuarto → Ganzfeld.
+//
+//  Sin librerías: WebGL puro + Web Audio. Funciona en iPhone (Safari)
+//  con visión estéreo dibujada por el propio código.
+//
+//  Parámetros de URL para probar estados:
+//    ?modo=memoria          últimos 7 días acelerados
+//    ?pm=30&o3=90&sol=2     fija PM2.5, ozono y altura del sol (grados)
+// ============================================================
+
+const CFG = {
+  lat: 25.6866, lon: -100.3161,
+  radioAbertura: 50,           // grados desde el cenit
+  limiteOMS: 15, pmLimpio: 5, pmSucio: 35, ozonoBajo: 40, ozonoAlto: 120,
+  actualizarCada: 15 * 60 * 1000,
+  tauVivo: 90,                 // s: en vivo, los cambios tardan minutos
+  tauMemoria: 1.2,             // s: en modo memoria, transiciones rápidas
+  segundosPorHoraMemoria: 2.5, // 7 días ≈ 7 minutos
+  fovCardboard: 90, fovPantalla: 75
+};
+
+const params = new URLSearchParams(location.search);
+let modoMemoria = params.get('modo') === 'memoria';
+const fijo = {
+  pm: params.has('pm') ? parseFloat(params.get('pm')) : null,
+  o3: params.has('o3') ? parseFloat(params.get('o3')) : null,
+  sol: params.has('sol') ? parseFloat(params.get('sol')) : null
+};
+
+// ---------- estado ----------
+let serie = [];            // [{t: Date, pm, o3}] últimos 7 días + hoy
+let objetivo = { pm: 10, pm24: 10, o3: 50, sol: alturaSol(new Date()) };
+let actual = null;         // valores suavizados
+let ultimaCarga = 0, errorDatos = '', primeraCarga = true;
+let cursorMemoria = 0;     // horas desde el inicio de la serie
+aplicarFijos();
+let vista = 'menu';        // 'menu' | 'pantalla' | 'cardboard'
+let separacion = 0.5;
+try { const s = localStorage.getItem('cr_sep'); if (s) separacion = parseFloat(s); } catch (e) {}
+
+// ============================================================
+//  DATOS
+// ============================================================
+async function cargarDatos() {
+  ultimaCarga = Date.now();
+  const url = 'https://air-quality-api.open-meteo.com/v1/air-quality' +
+    '?latitude=' + CFG.lat + '&longitude=' + CFG.lon +
+    '&hourly=pm2_5,ozone&past_days=7&forecast_days=1&timezone=America%2FMonterrey';
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('error ' + r.status);
+    const j = await r.json();
+    const s = [];
+    for (let i = 0; i < j.hourly.time.length; i++) {
+      if (j.hourly.pm2_5[i] == null) continue;
+      // Monterrey no tiene horario de verano desde 2022: UTC−6 todo el año
+      s.push({ t: new Date(j.hourly.time[i] + ':00-06:00'), pm: j.hourly.pm2_5[i],
+        o3: j.hourly.ozone[i] == null ? CFG.ozonoBajo : j.hourly.ozone[i] });
+    }
+    if (s.length < 24) throw new Error('pocos datos');
+    serie = s;
+    errorDatos = '';
+  } catch (e) {
+    errorDatos = 'Sin conexión con los datos (' + e.message + '). ' +
+      (serie.length ? 'Uso la última lectura.' : 'Muestro un cielo de referencia.');
+  }
+  actualizarObjetivoVivo();
+  if (primeraCarga) { actual = null; primeraCarga = false; }   // la primera lectura entra sin transición
+  pintarEstado();
+}
+
+function indiceAhora(fecha) {
+  let k = -1;
+  for (let i = 0; i < serie.length; i++) if (serie[i].t <= fecha) k = i;
+  return k;
+}
+
+function promedio24(k) {
+  let suma = 0, n = 0;
+  for (let i = Math.max(0, k - 23); i <= k; i++) { suma += serie[i].pm; n++; }
+  return n ? suma / n : 0;
+}
+
+function actualizarObjetivoVivo() {
+  const ahora = new Date();
+  objetivo.sol = alturaSol(ahora);
+  const k = indiceAhora(ahora);
+  if (k >= 0) {
+    objetivo.pm = serie[k].pm;
+    objetivo.o3 = serie[k].o3;
+    objetivo.pm24 = promedio24(k);
+  }
+  aplicarFijos();
+}
+
+function aplicarFijos() {
+  if (fijo.pm != null) { objetivo.pm = fijo.pm; objetivo.pm24 = fijo.pm; }
+  if (fijo.o3 != null) objetivo.o3 = fijo.o3;
+  if (fijo.sol != null) objetivo.sol = fijo.sol;
+}
+
+function horasMemoria() {
+  const k = indiceAhora(new Date());
+  const fin = k >= 0 ? k : serie.length - 1;
+  return { ini: Math.max(24, fin - 167), fin };   // deja 24 h previas para el promedio
+}
+
+function actualizarObjetivoMemoria(dt) {
+  if (serie.length < 48) return actualizarObjetivoVivo();
+  const { ini, fin } = horasMemoria();
+  cursorMemoria += dt / CFG.segundosPorHoraMemoria;
+  if (cursorMemoria > fin - ini) cursorMemoria = 0;
+  const pos = ini + cursorMemoria, i0 = Math.floor(pos), i1 = Math.min(i0 + 1, fin), f = pos - i0;
+  const a = serie[i0], b = serie[i1];
+  const t = new Date(a.t.getTime() + (b.t - a.t) * f);
+  objetivo.pm = a.pm + (b.pm - a.pm) * f;
+  objetivo.o3 = a.o3 + (b.o3 - a.o3) * f;
+  objetivo.pm24 = promedio24(i0) + (promedio24(i1) - promedio24(i0)) * f;
+  objetivo.sol = alturaSol(t);
+  objetivo.fecha = t;
+  aplicarFijos();
+}
+
+// Altura del sol en grados (aproximación astronómica, error < 1°)
+function alturaSol(fecha, lat = CFG.lat, lon = CFG.lon) {
+  const rad = Math.PI / 180;
+  const d = fecha.getTime() / 86400000 + 2440587.5 - 2451545.0;
+  const g = ((357.529 + 0.98560028 * d) % 360) * rad;
+  const q = (280.459 + 0.98564736 * d) % 360;
+  const L = (q + 1.915 * Math.sin(g) + 0.020 * Math.sin(2 * g)) * rad;
+  const e = (23.439 - 0.00000036 * d) * rad;
+  const ra = Math.atan2(Math.cos(e) * Math.sin(L), Math.cos(L));
+  const dec = Math.asin(Math.sin(e) * Math.sin(L));
+  const gmst = (((18.697374558 + 24.06570982441908 * d) % 24) + 24) % 24;
+  const H = (gmst * 15 + lon) * rad - ra;
+  return Math.asin(Math.sin(lat * rad) * Math.sin(dec) +
+    Math.cos(lat * rad) * Math.cos(dec) * Math.cos(H)) / rad;
+}
+
+function describirSol(a) {
+  if (a < -12) return 'noche';
+  if (a < 0) return 'crepúsculo';
+  if (a < 10) return 'sol bajo';
+  return 'día';
+}
+
+function pintarEstado() {
+  const o = objetivo;
+  let t = 'PM2.5 ahora: <b>' + o.pm.toFixed(1) + ' µg/m³</b> · promedio 24 h: ' + o.pm24.toFixed(1) +
+    (o.pm24 > CFG.limiteOMS ? ' · <b>por encima de la guía OMS</b>' : '') +
+    '<br>Ozono: ' + o.o3.toFixed(0) + ' µg/m³ · Sol: ' + o.sol.toFixed(0) + '° (' + describirSol(o.sol) + ')';
+  if (fijo.pm != null || fijo.o3 != null || fijo.sol != null) t += '<br><i>Valores fijados por la URL (modo de prueba)</i>';
+  if (errorDatos) t += '<br><i>' + errorDatos + '</i>';
+  t += '<br><span style="opacity:.6">Datos: Open-Meteo · CAMS (CC BY 4.0)</span>';
+  document.getElementById('estado').innerHTML = t;
+}
+
+// ============================================================
+//  DE DATOS A COLOR
+// ============================================================
+const lerp = (a, b, t) => a + (b - a) * t;
+const mez = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+const esc = (a, k) => [a[0] * k, a[1] * k, a[2] * k];
+const lim = (x) => Math.min(1, Math.max(0, x));
+const suave = (x) => x * x * (3 - 2 * x);
+const pasoSuave = (a, b, x) => suave(lim((x - a) / (b - a)));
+
+// Cielo limpio según la altura del sol: [altura, cenit, borde]
+const CIELO = [
+  [-18, [0.02, 0.03, 0.08], [0.04, 0.05, 0.12]],
+  [-8,  [0.08, 0.08, 0.26], [0.40, 0.22, 0.38]],
+  [-2,  [0.16, 0.22, 0.55], [0.98, 0.55, 0.35]],
+  [6,   [0.20, 0.40, 0.80], [1.00, 0.78, 0.55]],
+  [25,  [0.15, 0.42, 0.90], [0.70, 0.85, 1.00]],
+  [60,  [0.12, 0.38, 0.88], [0.62, 0.80, 1.00]]
+];
+
+function cieloLimpio(alt) {
+  if (alt <= CIELO[0][0]) return [CIELO[0][1], CIELO[0][2]];
+  for (let i = 1; i < CIELO.length; i++) {
+    if (alt <= CIELO[i][0]) {
+      const t = suave((alt - CIELO[i - 1][0]) / (CIELO[i][0] - CIELO[i - 1][0]));
+      return [mez(CIELO[i - 1][1], CIELO[i][1], t), mez(CIELO[i - 1][2], CIELO[i][2], t)];
+    }
+  }
+  const u = CIELO[CIELO.length - 1];
+  return [u[1], u[2]];
+}
+
+function calcularColores(v) {
+  const sucio = suave(lim((v.pm - CFG.pmLimpio) / (CFG.pmSucio - CFG.pmLimpio)));
+  const ozo = lim((v.o3 - CFG.ozonoBajo) / (CFG.ozonoAlto - CFG.ozonoBajo));
+  const ganz = suave(lim((v.pm24 - (CFG.limiteOMS - 3)) / 8));
+  const luz = 0.12 + 0.88 * pasoSuave(-12, 8, v.sol);   // brillo general (de noche, luz tenue en el cuarto)
+
+  let [cen, bor] = cieloLimpio(v.sol);
+  cen = mez(cen, esc([0.47, 0.42, 0.37], luz), sucio);
+  bor = mez(bor, esc([0.80, 0.64, 0.44], luz), sucio);
+  cen = mez(cen, esc([0.84, 0.75, 0.37], luz), ozo * 0.25);
+  bor = mez(bor, esc([0.84, 0.75, 0.37], luz), ozo * 0.2);
+
+  let muroA = mez(esc([0.93, 0.91, 0.88], luz), bor, 0.3);
+  let muroB = esc([0.28, 0.28, 0.30], luz);
+  const plano = mez(cen, bor, 0.5);
+  cen = mez(cen, plano, ganz); bor = mez(bor, plano, ganz);
+  muroA = mez(muroA, plano, ganz); muroB = mez(muroB, plano, ganz);
+  const niebla = esc([0.67, 0.59, 0.47], luz);
+  return { cen, bor, muroA, muroB, niebla, sucio, ozo, ganz };
+}
+
+// ============================================================
+//  WEBGL
+// ============================================================
+const lienzo = document.getElementById('lienzo');
+const gl = lienzo.getContext('webgl', { antialias: false, preserveDrawingBuffer: true });
+
+const VS = `attribute vec2 p; varying vec2 uv; void main(){ uv = p; gl_Position = vec4(p, 0.0, 1.0); }`;
+const FS = `
+precision highp float;
+varying vec2 uv;
+uniform mat3 uRot;
+uniform vec2 uTan;
+uniform vec3 uCen, uBor, uMuroA, uMuroB, uNiebla;
+uniform float uSucio, uGanz, uBordeEl, uTiempo;
+
+float hash(vec3 p){ p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float ruido(vec3 x){
+  vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x), mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+             mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x), mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+float fbm(vec3 p){ float v = 0.0, a = 0.5; for (int i = 0; i < 4; i++){ v += a * ruido(p); p *= 2.03; a *= 0.5; } return v; }
+
+void main(){
+  vec3 dir = normalize(uRot * vec3(uv.x * uTan.x, uv.y * uTan.y, -1.0));
+  float el = degrees(asin(clamp(dir.y, -1.0, 1.0)));
+  float pluma = mix(0.4, 22.0, uGanz);
+  float cielo = smoothstep(uBordeEl - pluma, uBordeEl + pluma, el);
+  vec3 cCielo = mix(uBor, uCen, smoothstep(uBordeEl, 90.0, el));
+  vec3 cMuro = mix(uMuroB, uMuroA, pow(smoothstep(-90.0, uBordeEl, el), 1.6));
+  vec3 col = mix(cMuro, cCielo, cielo);
+
+  // Neblina: ruido 3D sobre la dirección de la mirada (sin costuras)
+  float n = fbm(dir * 2.4 + vec3(0.0, 0.0, uTiempo));
+  n = mix(n, 0.5, uGanz);
+  float cant = clamp(uSucio * 0.85 * n * cielo + uGanz * 0.25, 0.0, 0.85);
+  col = mix(col, uNiebla, cant);
+
+  // Tramado para evitar bandas en los degradados
+  col += (hash(vec3(gl_FragCoord.xy, uTiempo * 60.0)) - 0.5) / 255.0;
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+function compilar(tipo, src) {
+  const s = gl.createShader(tipo);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compilar(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compilar(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+const locP = gl.getAttribLocation(prog, 'p');
+gl.enableVertexAttribArray(locP);
+gl.vertexAttribPointer(locP, 2, gl.FLOAT, false, 0, 0);
+const U = {};
+['uRot', 'uTan', 'uCen', 'uBor', 'uMuroA', 'uMuroB', 'uNiebla', 'uSucio', 'uGanz', 'uBordeEl', 'uTiempo']
+  .forEach(n => U[n] = gl.getUniformLocation(prog, n));
+
+function ajustarTamano() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  lienzo.width = Math.round(innerWidth * dpr);
+  lienzo.height = Math.round(innerHeight * dpr);
+}
+addEventListener('resize', ajustarTamano);
+ajustarTamano();
+
+// ============================================================
+//  ORIENTACIÓN (giroscopio en el teléfono, arrastre en computadora)
+// ============================================================
+let qCam = [0, 0, 0, 1];
+let orient = null;
+let arrastre = { yaw: 0, pitch: 0.6 };    // en pantalla empieza mirando un poco hacia arriba
+
+function qMul(a, b) {
+  return [a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+          a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+          a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+          a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]];
+}
+function qEulerYXZ(x, y, z) {
+  const c1 = Math.cos(x / 2), c2 = Math.cos(y / 2), c3 = Math.cos(z / 2);
+  const s1 = Math.sin(x / 2), s2 = Math.sin(y / 2), s3 = Math.sin(z / 2);
+  return [s1 * c2 * c3 + c1 * s2 * s3, c1 * s2 * c3 - s1 * c2 * s3,
+          c1 * c2 * s3 - s1 * s2 * c3, c1 * c2 * c3 + s1 * s2 * s3];
+}
+function qEje(eje, ang) { const s = Math.sin(ang / 2); return [eje[0] * s, eje[1] * s, eje[2] * s, Math.cos(ang / 2)]; }
+function matDeQ(q) {   // mat3 en orden de columnas (como lo espera WebGL)
+  const [x, y, z, w] = q;
+  return new Float32Array([
+    1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w),
+    2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w),
+    2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)]);
+}
+const Q_ATRAS = [-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)];   // la cámara mira por la parte trasera del teléfono
+
+addEventListener('deviceorientation', (e) => { if (e.alpha != null) orient = e; });
+
+function anguloPantalla() {
+  const a = (screen.orientation && screen.orientation.angle != null) ? screen.orientation.angle : (window.orientation || 0);
+  return a * Math.PI / 180;
+}
+
+function actualizarCamara() {
+  if (orient && vista !== 'menu') {
+    const r = Math.PI / 180;
+    let q = qEulerYXZ(orient.beta * r, orient.alpha * r, -orient.gamma * r);
+    q = qMul(q, Q_ATRAS);
+    q = qMul(q, qEje([0, 0, 1], -anguloPantalla()));
+    qCam = q;
+  } else {
+    qCam = qEulerYXZ(arrastre.pitch, arrastre.yaw, 0);
+    if (vista === 'menu') arrastre.yaw += 0.0004;       // giro lento detrás del menú
+  }
+}
+
+let puntero = null;
+lienzo.addEventListener('pointerdown', (e) => { puntero = { x: e.clientX, y: e.clientY }; });
+addEventListener('pointerup', () => { puntero = null; });
+addEventListener('pointermove', (e) => {
+  if (!puntero || orient) return;
+  arrastre.yaw += (e.clientX - puntero.x) * 0.005;
+  arrastre.pitch = Math.max(-1.5, Math.min(1.5, arrastre.pitch + (e.clientY - puntero.y) * 0.005));
+  puntero = { x: e.clientX, y: e.clientY };
+});
+
+// ============================================================
+//  SONIDO (Web Audio con espacialización HRTF)
+//  Voces puras desde el cielo; con contaminación entran voces alrededor,
+//  desafinadas; en Ganzfeld el sonido pierde dirección.
+// ============================================================
+let audio = null;
+function iniciarAudio() {
+  if (audio) { audio.ctx.resume(); return; }
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  const ctx = new Ctx();
+  const master = ctx.createGain(); master.gain.value = 0;
+  const filtro = ctx.createBiquadFilter(); filtro.type = 'lowpass'; filtro.frequency.value = 300;
+  filtro.connect(master); master.connect(ctx.destination);
+  const voces = [1, 1.5, 2, 3, 4.5, 6].map((r, i) => {
+    const o = ctx.createOscillator(); o.type = i < 2 ? 'sine' : 'triangle'; o.frequency.value = 55 * r;
+    const g = ctx.createGain(); g.gain.value = 0;
+    const p = ctx.createPanner(); p.panningModel = 'HRTF'; p.distanceModel = 'inverse'; p.refDistance = 10;
+    const dirG = ctx.createGain(), difG = ctx.createGain();
+    o.connect(g); g.connect(p); p.connect(dirG); dirG.connect(filtro); g.connect(difG); difG.connect(filtro);
+    o.start();
+    return { o, g, p, dirG, difG, i };
+  });
+  master.gain.setTargetAtTime(0.22, ctx.currentTime, 3);
+  audio = { ctx, master, filtro, voces };
+}
+
+function posicionar(p, x, y, z, t) {
+  if (p.positionX) { p.positionX.setValueAtTime(x, t); p.positionY.setValueAtTime(y, t); p.positionZ.setValueAtTime(z, t); }
+  else p.setPosition(x, y, z);
+}
+
+function actualizarAudio(c, seg) {
+  if (!audio || audio.ctx.state !== 'running') return;
+  const t = audio.ctx.currentTime, L = audio.ctx.listener;
+  const m = matDeQ(qCam);                    // columnas: x, y, z de la cámara
+  const fx = -m[6], fy = -m[7], fz = -m[8], ux = m[3], uy = m[4], uz = m[5];
+  if (L.forwardX) {
+    L.forwardX.setValueAtTime(fx, t); L.forwardY.setValueAtTime(fy, t); L.forwardZ.setValueAtTime(fz, t);
+    L.upX.setValueAtTime(ux, t); L.upY.setValueAtTime(uy, t); L.upZ.setValueAtTime(uz, t);
+  } else if (L.setOrientation) L.setOrientation(fx, fy, fz, ux, uy, uz);
+
+  audio.voces.forEach(v => {
+    const i = v.i;
+    const nivel = i < 2 ? 0.35 : lim((c.sucio - (i - 2) / 4) * 4) * 0.22;
+    v.g.gain.setTargetAtTime(nivel, t, 0.5);
+    v.o.detune.setTargetAtTime((i % 2 ? 1 : -1) * c.sucio * 9 * (i + 1), t, 0.5);
+    v.dirG.gain.setTargetAtTime(1 - 0.85 * c.ganz, t, 0.5);
+    v.difG.gain.setTargetAtTime(0.85 * c.ganz * 0.5, t, 0.5);
+    let az, el;
+    if (i < 2) { az = seg * 2 * Math.PI / 180 + i * Math.PI; el = 75 * Math.PI / 180; }
+    else { az = (i - 2) * Math.PI / 2 + (i % 2 ? 1 : -1) * seg * 2 * Math.PI / 120; el = 5 * Math.PI / 180; }
+    posicionar(v.p, 6 * Math.cos(el) * Math.sin(az), 6 * Math.sin(el), -6 * Math.cos(el) * Math.cos(az), t);
+  });
+  audio.filtro.frequency.setTargetAtTime(250 + c.sucio * 1400 + c.ozo * 300, t, 0.5);
+}
+
+// ============================================================
+//  BUCLE PRINCIPAL
+// ============================================================
+let tPrevio = performance.now(), tiempoNiebla = 0;
+const elInfo = document.getElementById('info');
+
+function cuadro(ahora) {
+  const dt = Math.min(0.1, (ahora - tPrevio) / 1000);
+  tPrevio = ahora;
+
+  if (Date.now() - ultimaCarga > CFG.actualizarCada) cargarDatos();
+  if (modoMemoria) actualizarObjetivoMemoria(dt);
+  else if (Math.floor(ahora / 30000) !== Math.floor((ahora - dt * 1000) / 30000)) actualizarObjetivoVivo();
+
+  if (!actual) actual = { ...objetivo };
+  const prueba = fijo.pm != null || fijo.o3 != null || fijo.sol != null;
+  const k = 1 - Math.exp(-dt / (modoMemoria || prueba ? CFG.tauMemoria : CFG.tauVivo));
+  for (const p of ['pm', 'pm24', 'o3', 'sol']) actual[p] += (objetivo[p] - actual[p]) * k;
+
+  const c = calcularColores(actual);
+  tiempoNiebla += dt * (0.02 + 0.08 * c.sucio);
+
+  actualizarCamara();
+  dibujar(c);
+  if (Math.floor(ahora / 100) !== Math.floor((ahora - dt * 1000) / 100)) actualizarAudio(c, ahora / 1000);
+
+  if (vista === 'pantalla') {
+    const f = modoMemoria && objetivo.fecha ? objetivo.fecha : new Date();
+    elInfo.textContent = (modoMemoria ? 'Memoria · ' : 'En vivo · ') +
+      f.toLocaleString('es-MX', { timeZone: 'America/Monterrey', weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' }) +
+      ' · PM2.5 ' + actual.pm.toFixed(1) + ' µg/m³' + (actual.pm24 > CFG.limiteOMS ? ' · por encima de la guía OMS' : '');
+  }
+  requestAnimationFrame(cuadro);
+}
+
+function dibujar(c) {
+  const W = lienzo.width, H = lienzo.height;
+  gl.uniformMatrix3fv(U.uRot, false, matDeQ(qCam));
+  gl.uniform3fv(U.uCen, c.cen); gl.uniform3fv(U.uBor, c.bor);
+  gl.uniform3fv(U.uMuroA, c.muroA); gl.uniform3fv(U.uMuroB, c.muroB); gl.uniform3fv(U.uNiebla, c.niebla);
+  gl.uniform1f(U.uSucio, c.sucio); gl.uniform1f(U.uGanz, c.ganz);
+  gl.uniform1f(U.uBordeEl, 90 - CFG.radioAbertura); gl.uniform1f(U.uTiempo, tiempoNiebla);
+
+  gl.disable(gl.SCISSOR_TEST);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+
+  if (vista === 'cardboard') {
+    // Dos vistas, una por ojo, centradas según la separación de lentes
+    const ancho = Math.round(W * separacion);
+    const tanY = Math.tan(CFG.fovCardboard * Math.PI / 360);
+    gl.enable(gl.SCISSOR_TEST);
+    for (const lado of [-1, 1]) {
+      const cx = W / 2 + lado * ancho / 2;
+      const x = Math.round(cx - ancho / 2);
+      gl.viewport(x, 0, ancho, H);
+      gl.scissor(Math.max(0, x), 0, ancho, H);
+      gl.uniform2f(U.uTan, tanY * ancho / H, tanY);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+  } else {
+    const tanY = Math.tan(CFG.fovPantalla * Math.PI / 360);
+    gl.viewport(0, 0, W, H);
+    gl.uniform2f(U.uTan, tanY * W / H, tanY);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+}
+
+// ============================================================
+//  MENÚ
+// ============================================================
+const menu = document.getElementById('menu'), btnSalir = document.getElementById('salir');
+const sep = document.getElementById('sep');
+sep.value = separacion;
+sep.addEventListener('input', () => {
+  separacion = parseFloat(sep.value);
+  try { localStorage.setItem('cr_sep', separacion); } catch (e) {}
+});
+
+const btnModo = document.getElementById('btnModo');
+function textoModo() { btnModo.textContent = modoMemoria ? 'Cambiar a: en vivo' : 'Modo memoria: últimos 7 días'; }
+textoModo();
+btnModo.addEventListener('click', () => { modoMemoria = !modoMemoria; cursorMemoria = 0; actual = null; textoModo(); });
+
+async function pedirSensores() {
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission) {
+      await DeviceOrientationEvent.requestPermission();      // iPhone: pide permiso al tocar
+    }
+  } catch (e) {}
+}
+let bloqueoPantalla = null;
+async function mantenerEncendida() {
+  try { if (navigator.wakeLock) bloqueoPantalla = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+
+async function entrar(modo) {
+  await pedirSensores();
+  iniciarAudio();
+  mantenerEncendida();
+  vista = modo;
+  menu.classList.add('oculto');
+  elInfo.classList.toggle('oculto', modo !== 'pantalla');
+  try { if (document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen(); } catch (e) {}
+  try { if (screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape'); } catch (e) {}
+}
+document.getElementById('btnCardboard').addEventListener('click', () => entrar('cardboard'));
+document.getElementById('btnPantalla').addEventListener('click', () => entrar('pantalla'));
+
+// Un toque durante la obra muestra el botón para salir (5 s)
+let ocultarSalir = 0;
+lienzo.addEventListener('click', () => {
+  if (vista === 'menu') return;
+  btnSalir.classList.remove('oculto');
+  clearTimeout(ocultarSalir);
+  ocultarSalir = setTimeout(() => btnSalir.classList.add('oculto'), 5000);
+});
+btnSalir.addEventListener('click', () => {
+  vista = 'menu';
+  menu.classList.remove('oculto');
+  btnSalir.classList.add('oculto');
+  elInfo.classList.add('oculto');
+  pintarEstado();
+  try { if (document.fullscreenElement) document.exitFullscreen(); } catch (e) {}
+});
+
+// ============================================================
+cargarDatos();
+requestAnimationFrame(cuadro);
+</script>
+</body>
+</html>
